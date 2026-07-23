@@ -2202,7 +2202,7 @@ function renderItem(item) {
   controls.className = 'item-controls';
 
   let select = null;
-  if (item.renditions && item.renditions.length > 0) {
+  if (item.sourceKind !== 'progressive' && item.renditions && item.renditions.length > 0) {
     select = document.createElement('select');
     select.className = 'quality-select';
     for (const rendition of item.renditions) {
@@ -2228,17 +2228,24 @@ function renderItem(item) {
     button.textContent = 'Downloading\u2026';
     errorEl.hidden = true;
     const renditionId = select ? select.value : null;
-    const response = await sendToBackground(MSG_TYPE.START_DOWNLOAD, {
-      itemId: item.id,
-      tabId: item.tabId,
-      renditionId,
-    });
-    if (response && response.ok) {
-      button.textContent = 'Downloaded';
-    } else {
+    try {
+      const response = await sendToBackground(MSG_TYPE.START_DOWNLOAD, {
+        itemId: item.id,
+        tabId: item.tabId,
+        renditionId,
+      });
+      if (response && response.ok) {
+        button.textContent = 'Downloaded';
+      } else {
+        button.disabled = false;
+        button.textContent = 'Download';
+        errorEl.textContent = (response && response.error) || 'Download failed';
+        errorEl.hidden = false;
+      }
+    } catch (err) {
       button.disabled = false;
       button.textContent = 'Download';
-      errorEl.textContent = (response && response.error) || 'Download failed';
+      errorEl.textContent = (err && err.message) || 'Download failed';
       errorEl.hidden = false;
     }
   });
@@ -2530,6 +2537,8 @@ No gaps found requiring an added task.
 **5. Execution-phase fix (found during Task 7's task review, not planning):** `mergeTsWithTransmuxer` originally registered only `'data'` and `'done'` listeners on the transmuxer. If the real mux.js `Transmuxer` ever emits an asynchronous `'error'` event (malformed/corrupt TS segment data), the returned Promise had no path to reject — it would hang forever with no timeout. Fixed by registering an `'error'` listener that rejects the Promise, with a corresponding test (`mergeTsWithTransmuxer rejects when the transmuxer emits an error event`). This is reflected in Task 7's code above; flagging it here because it was caught by the task-reviewer subagent during execution, not by the planning-time scratch-directory verification — a reminder that the review gate catches what execution-time verification of pure logic doesn't (async event-emitter edge cases needing an adversarial "what if this branch fires" read, not just a happy-path test run).
 
 **6. Execution-phase fix (Critical, found during Task 9's task review):** `classifyRequest` originally checked `contentType` before checking whether the URL was a bare `.ts`/`.m4s` segment. Real CDNs commonly serve MPEG-TS segments with `video/mp2t` and CMAF/fMP4 segments with `video/mp4`/`audio/mp4` content-types — so on real traffic (not just an edge case), every segment of every HLS/DASH stream would have been misclassified as a standalone `progressive-video`/`progressive-audio` item instead of correctly returning `null`, flooding the popup with false-positive detections. The planning-time execution verification never caught this because its own test fixtures only combined segment URLs with `contentType: null`. Fixed by checking the segment-extension pattern unconditionally, first, before any content-type check. A regression test (`classifyRequest ignores segments even when served with a real video/audio content-type`) now covers exactly the previously-untested combination.
+
+**7. Execution-phase fix (Important, found during Task 14's task review):** the Download button's click handler had no `try`/`catch` around `await sendToBackground(...)`. `chrome.runtime.sendMessage` can reject with a real, commonly-hit error ("Could not establish connection. Receiving end does not exist.") — e.g. if the MV3 service worker is asleep and still waking when the popup sends its message — and an unhandled rejection there left the button permanently stuck on "Downloading…" with no feedback, violating the requirement that failures must always be visibly recoverable. Fixed by wrapping the call in try/catch, restoring the button on either the `{ok:false}` path or a thrown rejection. Also hardened the quality-dropdown condition to explicitly exclude `sourceKind === 'progressive'` (defensive; the actual data flow through `service-worker.js` never gives progressive items a non-empty `renditions` array, so this wasn't a live bug, but making the invariant explicit in this file too removes the implicit cross-file dependency).
 
 All fixes are reflected in the task bodies above, not just here — an implementer reading only a given task will already see the corrected code.
 
