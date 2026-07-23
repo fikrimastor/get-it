@@ -1081,6 +1081,26 @@ test('mergeTsWithTransmuxer assembles the init segment and every data chunk from
 test('mergeTsWithTransmuxer rejects when there are no segments to merge', async () => {
   await assert.rejects(() => mergeTsWithTransmuxer([], {}));
 });
+
+test('mergeTsWithTransmuxer rejects when the transmuxer emits an error event', async () => {
+  const fakeMuxjs = {
+    mp4: {
+      Transmuxer: class {
+        constructor() {
+          this.listeners = {};
+        }
+        on(event, handler) {
+          this.listeners[event] = handler;
+        }
+        push() {}
+        flush() {
+          this.listeners.error(new Error('corrupt segment'));
+        }
+      },
+    },
+  };
+  await assert.rejects(() => mergeTsWithTransmuxer([new ArrayBuffer(4)], fakeMuxjs), /corrupt segment/);
+});
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1158,6 +1178,9 @@ export function mergeTsWithTransmuxer(segmentBuffers, muxjsInstance) {
       }
       resolve(new Blob(parts, { type: 'video/mp4' }));
     });
+    transmuxer.on('error', (err) => {
+      reject(err instanceof Error ? err : new Error(String(err)));
+    });
 
     try {
       for (const buffer of segmentBuffers) {
@@ -1193,7 +1216,7 @@ export async function mergeSplitTracks(rendition, fetchFn = fetch) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm test`
-Expected: 8 passing tests in `tests/merge-engine.test.js` (plus all prior tests still passing)
+Expected: 9 passing tests in `tests/merge-engine.test.js` (plus all prior tests still passing)
 
 - [ ] **Step 5: Commit**
 
@@ -2488,7 +2511,9 @@ No gaps found requiring an added task.
 **4. Execution verification (beyond the standard self-review checklist):** every pure-logic module and test file in Tasks 2–10 was extracted into a scratch directory and actually run with `node --test` during planning, not just mentally traced. This surfaced and fixed three real bugs the mental trace missed:
 - Task 4's `fakeRuntime()` test helper hung indefinitely on the "ignores messages of a different type" case — `onMessage`'s listener correctly returns `undefined` (not `true`) without ever calling `sendResponse` when a message doesn't match, but the original fake's `trigger()` only ever resolved via that callback, so the wrapping `Promise` never settled. Fixed by resolving immediately when the listener's return value signals it isn't keeping the channel open.
 - Task 8's `downloadBlob()` used a bare `setTimeout(..., 30000)` for delayed `URL.revokeObjectURL` cleanup — in Node this keeps the process alive for the full 30s even after all assertions pass, and masked/compounded the Task 4 hang in the first full run. Fixed with a guarded `.unref()` call (Node-only API; safe no-op in the real browser/service-worker runtime).
-- Task 1's `package.json` test script (`"node --test tests/"`) fails outright on Node v22 with `MODULE_NOT_FOUND` — passing a directory as an explicit path argument makes Node try to `require()` it rather than search it. Fixed to bare `node --test`, which auto-discovers `tests/*.test.js` and was confirmed working (50/50 tests passing, ~0.1s).
+- Task 1's `package.json` test script (`"node --test tests/"`) fails outright on Node v22 with `MODULE_NOT_FOUND` — passing a directory as an explicit path argument makes Node try to `require()` it rather than search it. Fixed to bare `node --test`, which auto-discovers `tests/*.test.js` and was confirmed working (51/51 tests passing, ~0.1s).
+
+**5. Execution-phase fix (found during Task 7's task review, not planning):** `mergeTsWithTransmuxer` originally registered only `'data'` and `'done'` listeners on the transmuxer. If the real mux.js `Transmuxer` ever emits an asynchronous `'error'` event (malformed/corrupt TS segment data), the returned Promise had no path to reject — it would hang forever with no timeout. Fixed by registering an `'error'` listener that rejects the Promise, with a corresponding test (`mergeTsWithTransmuxer rejects when the transmuxer emits an error event`). This is reflected in Task 7's code above; flagging it here because it was caught by the task-reviewer subagent during execution, not by the planning-time scratch-directory verification — a reminder that the review gate catches what execution-time verification of pure logic doesn't (async event-emitter edge cases needing an adversarial "what if this branch fires" read, not just a happy-path test run).
 
 All fixes are reflected in the task bodies above, not just here — an implementer reading only a given task will already see the corrected code.
 
