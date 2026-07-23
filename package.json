@@ -1,0 +1,10 @@
+{
+  "name": "get-it",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal-use browser extension that detects and downloads video/audio media.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
