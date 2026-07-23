@@ -1430,6 +1430,12 @@ test('classifyRequest ignores standalone segment files (.ts/.m4s) with no manife
   assert.equal(classifyRequest('https://a/seg-1.m4s', null), null);
 });
 
+test('classifyRequest ignores segments even when served with a real video/audio content-type', () => {
+  assert.equal(classifyRequest('https://a/seg-1.ts', 'video/mp2t'), null);
+  assert.equal(classifyRequest('https://a/seg-1.m4s', 'video/mp4'), null);
+  assert.equal(classifyRequest('https://a/seg-1.m4s', 'audio/mp4'), null);
+});
+
 test('classifyRequest ignores unrelated requests', () => {
   assert.equal(classifyRequest('https://a/page.html', 'text/html'), null);
 });
@@ -1477,9 +1483,18 @@ Expected: FAIL — `Cannot find module '../src/background/request-sniffer.js'`
 // src/background/request-sniffer.js
 
 const MEDIA_EXTENSIONS = /\.(mp4|webm|m3u8|mpd|m4s|ts|mp3|m4a|ogg|weba)(\?|$)/i;
+const MEDIA_SEGMENT_EXTENSIONS = /\.(m4s|ts)(\?|$)/i;
 const MEDIA_CONTENT_TYPES = /^(video\/|audio\/|application\/vnd\.apple\.mpegurl|application\/x-mpegurl|application\/dash\+xml)/i;
 
 export function classifyRequest(url, contentType) {
+  // Checked unconditionally, before content-type: real CDNs commonly serve
+  // .ts/.m4s segments with a genuine video/* or audio/* content-type, so a
+  // content-type-first check would misclassify every segment of every
+  // HLS/DASH stream as a standalone progressive item. Segments only matter
+  // once found via their parent manifest.
+  if (MEDIA_SEGMENT_EXTENSIONS.test(url)) {
+    return null;
+  }
   if (contentType && MEDIA_CONTENT_TYPES.test(contentType)) {
     if (/mpegurl/i.test(contentType)) return { kind: 'hls', url };
     if (/dash\+xml/i.test(contentType)) return { kind: 'dash', url };
@@ -1490,7 +1505,6 @@ export function classifyRequest(url, contentType) {
     if (/\.m3u8(\?|$)/i.test(url)) return { kind: 'hls', url };
     if (/\.mpd(\?|$)/i.test(url)) return { kind: 'dash', url };
     if (/\.(mp3|m4a|ogg|weba)(\?|$)/i.test(url)) return { kind: 'progressive-audio', url };
-    if (/\.(m4s|ts)(\?|$)/i.test(url)) return null; // raw segments are only meaningful via their parent manifest
     return { kind: 'progressive-video', url };
   }
   return null;
@@ -1517,7 +1531,7 @@ export function registerRequestSniffer(webRequestApi, onCandidate) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm test`
-Expected: 9 passing tests in `tests/request-sniffer.test.js` (plus all prior tests still passing)
+Expected: 10 passing tests in `tests/request-sniffer.test.js` (plus all prior tests still passing)
 
 - [ ] **Step 5: Commit**
 
@@ -2514,6 +2528,8 @@ No gaps found requiring an added task.
 - Task 1's `package.json` test script (`"node --test tests/"`) fails outright on Node v22 with `MODULE_NOT_FOUND` — passing a directory as an explicit path argument makes Node try to `require()` it rather than search it. Fixed to bare `node --test`, which auto-discovers `tests/*.test.js` and was confirmed working (51/51 tests passing, ~0.1s).
 
 **5. Execution-phase fix (found during Task 7's task review, not planning):** `mergeTsWithTransmuxer` originally registered only `'data'` and `'done'` listeners on the transmuxer. If the real mux.js `Transmuxer` ever emits an asynchronous `'error'` event (malformed/corrupt TS segment data), the returned Promise had no path to reject — it would hang forever with no timeout. Fixed by registering an `'error'` listener that rejects the Promise, with a corresponding test (`mergeTsWithTransmuxer rejects when the transmuxer emits an error event`). This is reflected in Task 7's code above; flagging it here because it was caught by the task-reviewer subagent during execution, not by the planning-time scratch-directory verification — a reminder that the review gate catches what execution-time verification of pure logic doesn't (async event-emitter edge cases needing an adversarial "what if this branch fires" read, not just a happy-path test run).
+
+**6. Execution-phase fix (Critical, found during Task 9's task review):** `classifyRequest` originally checked `contentType` before checking whether the URL was a bare `.ts`/`.m4s` segment. Real CDNs commonly serve MPEG-TS segments with `video/mp2t` and CMAF/fMP4 segments with `video/mp4`/`audio/mp4` content-types — so on real traffic (not just an edge case), every segment of every HLS/DASH stream would have been misclassified as a standalone `progressive-video`/`progressive-audio` item instead of correctly returning `null`, flooding the popup with false-positive detections. The planning-time execution verification never caught this because its own test fixtures only combined segment URLs with `contentType: null`. Fixed by checking the segment-extension pattern unconditionally, first, before any content-type check. A regression test (`classifyRequest ignores segments even when served with a real video/audio content-type`) now covers exactly the previously-untested combination.
 
 All fixes are reflected in the task bodies above, not just here — an implementer reading only a given task will already see the corrected code.
 
