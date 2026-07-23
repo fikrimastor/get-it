@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Get It — Settings</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <h1>Get It — Settings</h1>
+  <form id="settings-form">
+    <label>
+      Download subfolder
+      <input type="text" id="subfolder" />
+    </label>
+    <label>
+      Filename template
+      <input type="text" id="filenameTemplate" />
+      <small>Available placeholders: {title}, {quality}, {ext}</small>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" id="askWhereToSave" />
+      Always ask where to save each file
+    </label>
+    <label>
+      Max simultaneous downloads
+      <input type="number" id="maxConcurrentDownloads" min="1" max="10" />
+    </label>
+    <label>
+      Theme
+      <select id="theme">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+    <label>
+      Blacklisted domains (one per line — network sniffing is skipped on these)
+      <textarea id="blacklist" rows="4"></textarea>
+    </label>
+    <button type="submit">Save</button>
+    <span id="save-status" class="save-status" hidden>Saved.</span>
+  </form>
+  <script type="module" src="options.js"></script>
+</body>
+</html>
