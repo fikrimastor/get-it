@@ -39,3 +39,16 @@ test('isBlacklisted matches subdomains of a blacklisted domain', () => {
 test('isBlacklisted returns false for an empty blacklist', () => {
   assert.equal(isBlacklisted('example.com', { blacklist: [] }), false);
 });
+
+test('maxConcurrentDownloads defaults to 3', async () => {
+  const storage = fakeStorage();
+  const settings = await getSettings(storage);
+  assert.equal(settings.maxConcurrentDownloads, 3);
+});
+
+test('maxConcurrentDownloads is persisted and retrieved', async () => {
+  const storage = fakeStorage();
+  await setSettings({ maxConcurrentDownloads: 5 }, storage);
+  const settings = await getSettings(storage);
+  assert.equal(settings.maxConcurrentDownloads, 5);
+});

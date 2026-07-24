@@ -12,6 +12,25 @@
 const STORAGE_PREFIX = 'tabItems_';
 
 export function createTabStateStore(storageApi = chrome.storage.session) {
+  // Serializes read-modify-write operations per tabId. chrome.storage.session
+  // has no atomic read-modify-write primitive, and candidates can legitimately
+  // arrive concurrently for the same tab (multiple near-simultaneous network
+  // responses, or several frames independently reporting via content_scripts'
+  // all_frames: true) — an unserialized get-then-set race would let the
+  // second write silently clobber the first, dropping a detected item.
+  const tabLocks = new Map();
+
+  function withLock(tabId, fn) {
+    const previous = tabLocks.get(tabId) || Promise.resolve();
+    const next = previous.then(fn, fn);
+    const tail = next.catch(() => {});
+    tabLocks.set(tabId, tail);
+    tail.finally(() => {
+      if (tabLocks.get(tabId) === tail) tabLocks.delete(tabId);
+    });
+    return next;
+  }
+
   function keyFor(tabId) {
     return `${STORAGE_PREFIX}${tabId}`;
   }
@@ -26,22 +45,35 @@ export function createTabStateStore(storageApi = chrome.storage.session) {
     await storageApi.set({ [keyFor(tabId)]: items });
   }
 
-  async function addItem(tabId, item) {
-    const existing = await getItems(tabId);
-    const isDuplicate = existing.some(
-      (i) => i.manifestUrl === item.manifestUrl && i.progressiveUrl === item.progressiveUrl
-    );
-    if (isDuplicate) return existing;
-    const updated = [...existing, item];
-    await setItems(tabId, updated);
-    return updated;
+  function addItem(tabId, item, mergeDuplicate) {
+    return withLock(tabId, async () => {
+      const existing = await getItems(tabId);
+      const itemUrls = [item.manifestUrl, item.progressiveUrl].filter(Boolean);
+      const dupeIndex = existing.findIndex(
+        (i) => itemUrls.includes(i.manifestUrl) || itemUrls.includes(i.progressiveUrl)
+      );
+      if (dupeIndex !== -1) {
+        if (mergeDuplicate) {
+          const updated = [...existing];
+          updated[dupeIndex] = mergeDuplicate(updated[dupeIndex], item);
+          await setItems(tabId, updated);
+          return updated;
+        }
+        return existing;
+      }
+      const updated = [...existing, item];
+      await setItems(tabId, updated);
+      return updated;
+    });
   }
 
-  async function clearTab(tabId) {
-    await storageApi.remove(keyFor(tabId));
+  function clearTab(tabId) {
+    return withLock(tabId, async () => {
+      await storageApi.remove(keyFor(tabId));
+    });
   }
 
-  return { getItems, setItems, addItem, clearTab };
+  return { getItems, addItem, clearTab };
 }
 
 export function badgeTextFor(itemCount) {

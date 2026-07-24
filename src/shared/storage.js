@@ -4,9 +4,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   subfolder: 'GetIt',
   filenameTemplate: '{title}-{quality}.{ext}',
   askWhereToSave: false,
-  maxConcurrentDownloads: 3,
   theme: 'system',
   blacklist: [],
+  maxConcurrentDownloads: 3,
 });
 
 export async function getSettings(storageApi = chrome.storage.sync) {

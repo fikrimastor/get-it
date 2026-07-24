@@ -42,15 +42,17 @@ get-it/
 │   ├── shared/
 │   │   ├── media-item.js      (MediaItem/Rendition shape + factory functions)
 │   │   ├── storage.js         (chrome.storage.sync settings wrapper + blacklist matching)
+│   │   ├── theme.js           (data-theme switch for light/dark/system)
 │   │   └── messaging.js       (typed message-passing contract between content/background/popup)
 │   ├── background/
 │   │   ├── hls-parser.js      (parseM3U8: HLS master/media playlist → Rendition[])
 │   │   ├── dash-parser.js     (parseMPD: DASH MPD → Rendition[], $Number$ SegmentTemplate only)
 │   │   ├── merge-engine.js    (classifyMerge + concat/remux/split-tracks strategies)
 │   │   ├── downloader.js      (filename templating + chrome.downloads wiring)
-│   │   ├── tab-state.js       (per-tab detected-item store + badge text)
+│   │   ├── tab-state.js       (chrome.storage.session-backed per-tab store + badge)
 │   │   ├── request-sniffer.js (chrome.webRequest classification + wiring)
 │   │   ├── context-menu.js    (right-click "Download this video")
+│   │   ├── concurrency-limiter.js (FIFO [1,10] download-job limiter)
 │   │   └── service-worker.js  (entry point — wires everything above)
 │   ├── content/
 │   │   └── dom-scanner.js     (classic content script — DOM metadata enrichment)
@@ -71,7 +73,9 @@ get-it/
     ├── merge-engine.test.js
     ├── downloader.test.js
     ├── tab-state.test.js
-    └── request-sniffer.test.js
+    ├── request-sniffer.test.js
+    ├── theme.test.js
+    └── concurrency-limiter.test.js
 ```
 
 **Module system:** `manifest.json` declares the background as `"type": "module"`, so `service-worker.js` and everything it imports use ES `import`/`export`. `popup.html`/`options.html` load their scripts as `<script type="module">`, so they can import `src/shared/*.js` directly. `content/dom-scanner.js` is a **classic** (non-module) script — Chrome's `content_scripts` manifest key does not support `"type": "module"` — so it is deliberately self-contained with no imports (see Task 13 for the specific tradeoff this implies).
@@ -2616,7 +2620,7 @@ Three real bugs found and fixed during this task (full detail in each task's "Re
 2. `src/background/tab-state.js` — in-memory `Map` lost all detected items whenever Chrome recycled the MV3 service worker (which happens aggressively), so items could vanish between detection and the user opening the popup. Switched to `chrome.storage.session`, which is designed to survive worker restarts within a session.
 3. `src/background/service-worker.js` — the blacklist was only checked in the network-sniffing path (`handleCandidate`); the DOM-scan path (`DOM_SCAN_RESULT` handler) had no blacklist check at all, so a blacklisted page's embedded video was still detected via the content script regardless. Added the missing check. Also hardened `handleCandidate`'s own hostname resolution (checks both the tab's and the candidate's hostname, since `chrome.tabs.get(tabId).url` can be stale during an in-flight navigation).
 
-All fixes are committed with `fix:`/`feat:` prefixes on top of the original tasks' commits (history was kept clean — see each task's commit for the final, correct code). Full test suite: 55 passing, 0 failing, after every fix.
+Those Task 16 fixes were committed with `fix:`/`feat:` prefixes on top of the original tasks' commits (history was kept clean). The suite passed 55/55 at the Task 16 close; the later whole-branch remediation documented below raises the current final suite to 73/73.
 
 ```bash
 npm test
@@ -2625,6 +2629,22 @@ git commit -m "test: document Task 16 end-to-end verification results"
 ```
 
 ---
+
+### Final whole-branch review remediation
+
+After Task 16's browser verification, the final whole-branch review surfaced four additional gaps beyond those documented in the individual task bodies:
+
+- **DOM item-own hostname blacklist symmetry.** `service-worker.js` now derives a hostname from each `domItem.url` and checks it independently. Detection is skipped when either the sender page's hostname or the media resource's hostname is blacklisted, matching the network-sniffing path. Live Brave proof used a non-blacklisted local page embedding `https://www.w3schools.com/html/mov_bbb.mp4`: blacklisting `www.w3schools.com` left `chrome.storage.session` empty; clearing the blacklist and reloading restored the detected item.
+
+- **Serialized `chrome.storage.session` writes with atomic cross-field duplicate enrichment.** `tab-state.js` keeps a per-tab Promise tail in a `Map`, serializing each full read→dedup/merge→write operation. `addItem` matches any non-null URL across both `manifestUrl` and `progressiveUrl`, so the network and DOM paths cannot create cross-field duplicates; DOM title/poster enrichment occurs inside that same lock. The lock entry is removed after the latest operation settles.
+
+- **Working light/dark/system theme application in popup and options.** `popup.js` and `options.js` call `applyTheme` from `src/shared/theme.js`. Explicit light/dark preferences set `data-theme` on the document root; system removes the attribute and lets `prefers-color-scheme` CSS choose. Live Brave checks confirmed explicit dark, system-dark, and explicit light computed colors, plus persisted options values.
+
+- **Functional FIFO [1,10] download-job limiter.** `service-worker.js` runs every `START_DOWNLOAD` task body through `src/background/concurrency-limiter.js`. The dependency-free limiter serializes queued work in FIFO order, applies the latest configured limit globally, clamps it to [1,10], and releases a slot on either fulfillment or rejection. The options page persists the same bounded setting instead of exposing an inert control.
+
+- **Browser and automated proof.** `npm test` passes 73/73 with new theme, limiter, storage-race, and cross-field dedup regressions. Live Brave verification covers the resource-host blacklist case, detection restoration after clearing it, a real completed progressive MP4 download (788493 bytes; `ffprobe` duration 10.026667s), and light/dark/system theme behavior.
+
+- **Unchanged residual gaps.** HLS/fMP4, HLS/TS, and DASH live-stream E2E verification against real CDNs remains unexecuted (the same caveat as Task 16 Steps 2–4). These remediation fixes do not close that live-stream verification gap.
 
 ## Self-Review
 
@@ -2656,7 +2676,7 @@ No gaps found requiring an added task.
 
 **7. Execution-phase fix (Important, found during Task 14's task review):** the Download button's click handler had no `try`/`catch` around `await sendToBackground(...)`. `chrome.runtime.sendMessage` can reject with a real, commonly-hit error ("Could not establish connection. Receiving end does not exist.") — e.g. if the MV3 service worker is asleep and still waking when the popup sends its message — and an unhandled rejection there left the button permanently stuck on "Downloading…" with no feedback, violating the requirement that failures must always be visibly recoverable. Fixed by wrapping the call in try/catch, restoring the button on either the `{ok:false}` path or a thrown rejection. Also hardened the quality-dropdown condition to explicitly exclude `sourceKind === 'progressive'` (defensive; the actual data flow through `service-worker.js` never gives progressive items a non-empty `renditions` array, so this wasn't a live bug, but making the invariant explicit in this file too removes the implicit cross-file dependency).
 
-All fixes are reflected in the task bodies above, not just here — an implementer reading only a given task will already see the corrected code.
+Most fixes are reflected in the task bodies above — an implementer reading only a given task will already see the corrected code. The remediation section immediately above documents later whole-branch fixes that were applied after the original task bodies were committed.
 
 ---
 

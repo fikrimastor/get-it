@@ -1,5 +1,7 @@
 // src/popup/popup.js
 import { MSG_TYPE, sendToBackground } from '../shared/messaging.js';
+import { getSettings } from '../shared/storage.js';
+import { applyTheme } from '../shared/theme.js';
 
 const listEl = document.getElementById('item-list');
 const emptyEl = document.getElementById('empty-state');
@@ -93,6 +95,7 @@ function renderItem(item) {
 }
 
 async function init() {
+  applyTheme((await getSettings()).theme);
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!activeTab) return;
 

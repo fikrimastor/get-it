@@ -7,6 +7,7 @@ import { classifyMerge, mergeConcatFmp4, mergeRemuxTs, mergeSplitTracks, MERGE_S
 import { renderFilename, buildDownloadPath, downloadBlob, downloadUrl } from './downloader.js';
 import { getSettings, isBlacklisted } from '../shared/storage.js';
 import { MSG_TYPE, onMessage } from '../shared/messaging.js';
+import { createConcurrencyLimiter } from './concurrency-limiter.js';
 import { registerContextMenu } from './context-menu.js';
 
 // mux.js's UMD build reads `window` for feature detection; service workers
@@ -26,6 +27,9 @@ async function loadMuxJs() {
 // Backed by chrome.storage.session (see tab-state.js) so detected items
 // survive the service worker being torn down and restarted between
 // detection time and whenever the user actually opens the popup.
+
+// Shared concurrency limiter for all download operations.
+const downloadLimiter = createConcurrencyLimiter();
 const tabState = createTabStateStore();
 
 async function updateBadge(tabId) {
@@ -138,22 +142,13 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
   }
   for (const domItem of domItems) {
     if (!domItem.url || domItem.url.startsWith('blob:')) continue;
-    const items = await tabState.getItems(tabId);
-    const existingIndex = items.findIndex(
-      (i) => i.progressiveUrl === domItem.url || i.manifestUrl === domItem.url
-    );
-    if (existingIndex !== -1) {
-      const existing = items[existingIndex];
-      const merged = {
-        ...existing,
-        title: existing.title || domItem.title,
-        posterUrl: existing.posterUrl || domItem.posterUrl,
-      };
-      const updated = [...items];
-      updated[existingIndex] = merged;
-      await tabState.setItems(tabId, updated);
-      continue;
-    }
+    // Checked against the item's OWN hostname too, symmetric with
+    // handleCandidate's dual check: a page might not itself be blacklisted
+    // while embedding third-party media from a domain the user did
+    // blacklist, and the DOM scanner's independent detection path must
+    // honor that the same way the network-sniffing path does.
+    const domItemHostname = new URL(domItem.url).hostname;
+    if (isBlacklisted(domItemHostname, settings)) continue;
     const item = createMediaItem({
       tabId,
       sourceKind: SOURCE_KIND.PROGRESSIVE,
@@ -163,7 +158,11 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
       title: domItem.title,
       posterUrl: domItem.posterUrl,
     });
-    await tabState.addItem(tabId, item);
+    await tabState.addItem(tabId, item, (existing) => ({
+      ...existing,
+      title: existing.title || domItem.title,
+      posterUrl: existing.posterUrl || domItem.posterUrl,
+    }));
   }
   await updateBadge(tabId);
   return { ok: true };
@@ -179,46 +178,48 @@ onMessage(MSG_TYPE.START_DOWNLOAD, async ({ itemId, tabId, renditionId }) => {
   const item = items.find((i) => i.id === itemId);
   if (!item) return { ok: false, error: 'Item not found' };
 
-  try {
-    if (item.sourceKind === SOURCE_KIND.PROGRESSIVE) {
-      const ext = (item.progressiveUrl.split('.').pop() || 'mp4').split('?')[0];
-      const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: '', ext });
-      await downloadUrl(item.progressiveUrl, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
-      return { ok: true };
+  return downloadLimiter.run(async () => {
+    try {
+      if (item.sourceKind === SOURCE_KIND.PROGRESSIVE) {
+        const ext = (item.progressiveUrl.split('.').pop() || 'mp4').split('?')[0];
+        const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: '', ext });
+        await downloadUrl(item.progressiveUrl, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
+        return { ok: true };
+      }
+
+      const rendition = item.renditions.find((r) => r.id === renditionId) || item.renditions[0];
+      const strategy = classifyMerge(rendition);
+
+      if (strategy === MERGE_STRATEGY.CONCAT_FMP4) {
+        const blob = await mergeConcatFmp4(rendition, fetch);
+        const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
+        await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
+        return { ok: true };
+      }
+
+      if (strategy === MERGE_STRATEGY.REMUX_TS) {
+        const muxjs = await loadMuxJs();
+        const blob = await mergeRemuxTs(rendition, fetch, muxjs);
+        const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
+        await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
+        return { ok: true };
+      }
+
+      if (strategy === MERGE_STRATEGY.SPLIT_TRACKS) {
+        const { videoBlob, audioBlob } = await mergeSplitTracks(rendition, fetch);
+        const videoFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-video`, ext: 'mp4' });
+        const audioFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-audio`, ext: 'm4a' });
+        await downloadBlob(videoBlob, buildDownloadPath(settings.subfolder, videoFilename), chrome.downloads, settings.askWhereToSave);
+        await downloadBlob(audioBlob, buildDownloadPath(settings.subfolder, audioFilename), chrome.downloads, settings.askWhereToSave);
+        return { ok: true, note: 'Downloaded as separate video and audio files (split adaptive tracks — see Global Constraints).' };
+      }
+
+      return { ok: false, error: 'Unknown merge strategy' };
+    } catch (err) {
+      console.error('Get It: download failed', err);
+      return { ok: false, error: String(err && err.message ? err.message : err) };
     }
-
-    const rendition = item.renditions.find((r) => r.id === renditionId) || item.renditions[0];
-    const strategy = classifyMerge(rendition);
-
-    if (strategy === MERGE_STRATEGY.CONCAT_FMP4) {
-      const blob = await mergeConcatFmp4(rendition, fetch);
-      const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
-      await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
-      return { ok: true };
-    }
-
-    if (strategy === MERGE_STRATEGY.REMUX_TS) {
-      const muxjs = await loadMuxJs();
-      const blob = await mergeRemuxTs(rendition, fetch, muxjs);
-      const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
-      await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
-      return { ok: true };
-    }
-
-    if (strategy === MERGE_STRATEGY.SPLIT_TRACKS) {
-      const { videoBlob, audioBlob } = await mergeSplitTracks(rendition, fetch);
-      const videoFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-video`, ext: 'mp4' });
-      const audioFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-audio`, ext: 'm4a' });
-      await downloadBlob(videoBlob, buildDownloadPath(settings.subfolder, videoFilename), chrome.downloads, settings.askWhereToSave);
-      await downloadBlob(audioBlob, buildDownloadPath(settings.subfolder, audioFilename), chrome.downloads, settings.askWhereToSave);
-      return { ok: true, note: 'Downloaded as separate video and audio files (split adaptive tracks — see Global Constraints).' };
-    }
-
-    return { ok: false, error: 'Unknown merge strategy' };
-  } catch (err) {
-    console.error('Get It: download failed', err);
-    return { ok: false, error: String(err && err.message ? err.message : err) };
-  }
+  }, settings.maxConcurrentDownloads ?? 3);
 });
 
 registerContextMenu(chrome.contextMenus, chrome.tabs);

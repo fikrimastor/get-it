@@ -17,13 +17,13 @@
       <input type="text" id="filenameTemplate" />
       <small>Available placeholders: {title}, {quality}, {ext}</small>
     </label>
-    <label class="checkbox">
-      <input type="checkbox" id="askWhereToSave" />
-      Always ask where to save each file
-    </label>
     <label>
       Max simultaneous downloads
       <input type="number" id="maxConcurrentDownloads" min="1" max="10" />
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" id="askWhereToSave" />
+      Always ask where to save each file
     </label>
     <label>
       Theme
@@ -34,7 +34,7 @@
       </select>
     </label>
     <label>
-      Blacklisted domains (one per line — network sniffing is skipped on these)
+      Blacklisted domains (one per line — media detection is skipped on these)
       <textarea id="blacklist" rows="4"></textarea>
     </label>
     <button type="submit">Save</button>
