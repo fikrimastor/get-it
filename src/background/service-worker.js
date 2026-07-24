@@ -119,14 +119,21 @@ registerRequestSniffer(chrome.webRequest, handleCandidate);
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await tabState.clearTab(tabId);
 });
-chrome.webNavigation.onCommitted.addListener(async (details) => {
+async function clearTabOnNavigation(details) {
+  // frameId 0 = the top-level document, not an iframe. onCommitted alone
+  // misses client-side (History API) route changes -- very common on
+  // heavily-SPA sites -- where the URL and rendered page change without a
+  // real navigation ever committing, so onHistoryStateUpdated is also
+  // required or the previous page's detected items linger forever.
   if (details.frameId === 0) {
     await tabState.clearTab(details.tabId);
     await updateBadge(details.tabId);
   }
-});
+}
+chrome.webNavigation.onCommitted.addListener(clearTabOnNavigation);
+chrome.webNavigation.onHistoryStateUpdated.addListener(clearTabOnNavigation);
 
-onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
+onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems, pageTitle }, sender) => {
   const tabId = sender && sender.tab ? sender.tab.id : null;
   if (tabId == null) return { ok: false, error: 'DOM_SCAN_RESULT requires a content-script sender with a tab' };
   const settings = await getSettings();
@@ -134,6 +141,7 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
   if (senderHostname && isBlacklisted(senderHostname, settings)) {
     return { ok: true, skipped: 'blacklisted' };
   }
+  const touchedUrls = new Set();
   for (const domItem of domItems) {
     if (!domItem.url || domItem.url.startsWith('blob:')) continue;
     // Checked against the item's OWN hostname too, symmetric with
@@ -143,6 +151,7 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
     // honor that the same way the network-sniffing path does.
     const domItemHostname = new URL(domItem.url).hostname;
     if (isBlacklisted(domItemHostname, settings)) continue;
+    touchedUrls.add(domItem.url);
     const item = createMediaItem({
       tabId,
       sourceKind: SOURCE_KIND.PROGRESSIVE,
@@ -154,9 +163,26 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
     });
     await tabState.addItem(tabId, item, (existing) => ({
       ...existing,
-      title: existing.title || domItem.title,
+      // domItem.title is prioritized over the old title, not just used to
+      // fill a blank: dom-scanner.js already ranks it (video element
+      // title/aria-label > og:title/twitter:title > document.title), so
+      // it is never a worse choice than whatever the network-sniffing
+      // path guessed first (plain tab.title -- see handleCandidate).
+      title: domItem.title || existing.title,
       posterUrl: existing.posterUrl || domItem.posterUrl,
     }));
+  }
+  if (pageTitle) {
+    // Upgrades items this scan pass didn't otherwise touch -- chiefly
+    // network-only detections (HLS/DASH manifests, blob-backed players)
+    // that have no matching DOM <video src> for the loop above to ever
+    // reach, so without this they would be stuck with the raw tab title
+    // forever.
+    await tabState.updateItems(tabId, (item) => {
+      const itemUrl = item.progressiveUrl || item.manifestUrl;
+      if (touchedUrls.has(itemUrl)) return item;
+      return { ...item, title: pageTitle };
+    });
   }
   await updateBadge(tabId);
   return { ok: true };

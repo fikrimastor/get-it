@@ -73,7 +73,20 @@ export function createTabStateStore(storageApi = chrome.storage.session) {
     });
   }
 
-  return { getItems, addItem, clearTab };
+  // Applies patchFn to every stored item for a tab (e.g. a page-wide title
+  // upgrade discovered after the item was first detected). patchFn returning
+  // the same item reference unchanged is a safe no-op for items it doesn't
+  // want to touch.
+  function updateItems(tabId, patchFn) {
+    return withLock(tabId, async () => {
+      const existing = await getItems(tabId);
+      const updated = existing.map(patchFn);
+      await setItems(tabId, updated);
+      return updated;
+    });
+  }
+
+  return { getItems, addItem, clearTab, updateItems };
 }
 
 export function badgeTextFor(itemCount) {

@@ -146,3 +146,20 @@ test('concurrent duplicate enrichment under the per-tab lock does not drop or du
   assert.equal(second.title, 'Fresh', 'fresh item added concurrently survives');
   assert.equal(second.id, 'c', 'fresh item id preserved');
 });
+
+test('updateItems patches every stored item for a tab', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4', title: 'x1.mp4' });
+  await store.addItem(1, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4', title: 'x2.mp4' });
+  const updated = await store.updateItems(1, (item) => ({ ...item, title: `${item.title}-patched` }));
+  assert.deepEqual(updated.map((i) => i.title), ['x1.mp4-patched', 'x2.mp4-patched']);
+  assert.deepEqual((await store.getItems(1)).map((i) => i.title), ['x1.mp4-patched', 'x2.mp4-patched']);
+});
+
+test('updateItems does not affect other tabs', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4', title: 'a' });
+  await store.addItem(2, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4', title: 'b' });
+  await store.updateItems(1, (item) => ({ ...item, title: 'changed' }));
+  assert.equal((await store.getItems(2))[0].title, 'b');
+});
