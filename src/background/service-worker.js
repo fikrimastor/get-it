@@ -23,10 +23,13 @@ async function loadMuxJs() {
   return muxjsInstance;
 }
 
+// Backed by chrome.storage.session (see tab-state.js) so detected items
+// survive the service worker being torn down and restarted between
+// detection time and whenever the user actually opens the popup.
 const tabState = createTabStateStore();
 
-function updateBadge(tabId) {
-  const items = tabState.getItems(tabId);
+async function updateBadge(tabId) {
+  const items = await tabState.getItems(tabId);
   chrome.action.setBadgeText({ tabId, text: badgeTextFor(items.length) });
   chrome.action.setBadgeBackgroundColor({ tabId, color: '#4F46E5' });
 }
@@ -39,21 +42,35 @@ async function handleCandidate(tabId, candidate) {
   } catch {
     return;
   }
-  if (!tab.url) return;
-  const hostname = new URL(tab.url).hostname;
-  if (isBlacklisted(hostname, settings)) return;
+  // Blacklist is checked against BOTH the tab's currently-committed
+  // hostname and the candidate resource's own hostname. Neither signal is
+  // reliable alone: chrome.tabs.get(tabId).url can still reflect the
+  // PREVIOUS page while a navigation is in flight (a direct navigation to a
+  // raw media URL fires the media-typed request that triggers detection
+  // before the tab's url property updates), and the resource's own
+  // hostname is wrong to use alone for embedded media hosted on a
+  // different CDN domain than the page the user actually meant to
+  // blacklist. Checking both correctly covers a blacklisted page embedding
+  // third-party media, a direct navigation straight to a blacklisted
+  // media host, and everything in between.
+  const candidateHostname = new URL(candidate.url).hostname;
+  const tabHostname = tab.url ? new URL(tab.url).hostname : null;
+  if (isBlacklisted(candidateHostname, settings) || (tabHostname && isBlacklisted(tabHostname, settings))) {
+    return;
+  }
+  const pageUrl = tab.url || candidate.url;
 
   if (candidate.kind === 'progressive-video' || candidate.kind === 'progressive-audio') {
     const item = createMediaItem({
       tabId,
       sourceKind: SOURCE_KIND.PROGRESSIVE,
       mediaType: candidate.kind === 'progressive-audio' ? MEDIA_TYPE.AUDIO : MEDIA_TYPE.VIDEO,
-      pageUrl: tab.url,
+      pageUrl,
       progressiveUrl: candidate.url,
       title: tab.title,
     });
-    tabState.addItem(tabId, item);
-    updateBadge(tabId);
+    await tabState.addItem(tabId, item);
+    await updateBadge(tabId);
     return;
   }
 
@@ -65,13 +82,13 @@ async function handleCandidate(tabId, candidate) {
         tabId,
         sourceKind: SOURCE_KIND.HLS,
         mediaType: MEDIA_TYPE.VIDEO,
-        pageUrl: tab.url,
+        pageUrl,
         manifestUrl: candidate.url,
         title: tab.title,
         renditions,
       });
-      tabState.addItem(tabId, item);
-      updateBadge(tabId);
+      await tabState.addItem(tabId, item);
+      await updateBadge(tabId);
     } catch (err) {
       console.warn('Get It: failed to parse HLS manifest', candidate.url, err);
     }
@@ -86,13 +103,13 @@ async function handleCandidate(tabId, candidate) {
         tabId,
         sourceKind: SOURCE_KIND.DASH,
         mediaType: MEDIA_TYPE.VIDEO,
-        pageUrl: tab.url,
+        pageUrl,
         manifestUrl: candidate.url,
         title: tab.title,
         renditions,
       });
-      tabState.addItem(tabId, item);
-      updateBadge(tabId);
+      await tabState.addItem(tabId, item);
+      await updateBadge(tabId);
     } catch (err) {
       console.warn('Get It: failed to parse DASH manifest', candidate.url, err);
     }
@@ -101,23 +118,40 @@ async function handleCandidate(tabId, candidate) {
 
 registerRequestSniffer(chrome.webRequest, handleCandidate);
 
-chrome.tabs.onRemoved.addListener((tabId) => tabState.clearTab(tabId));
-chrome.webNavigation.onCommitted.addListener((details) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await tabState.clearTab(tabId);
+});
+chrome.webNavigation.onCommitted.addListener(async (details) => {
   if (details.frameId === 0) {
-    tabState.clearTab(details.tabId);
-    updateBadge(details.tabId);
+    await tabState.clearTab(details.tabId);
+    await updateBadge(details.tabId);
   }
 });
 
-onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ tabId, items: domItems }) => {
+onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
+  const tabId = sender && sender.tab ? sender.tab.id : null;
+  if (tabId == null) return { ok: false, error: 'DOM_SCAN_RESULT requires a content-script sender with a tab' };
+  const settings = await getSettings();
+  const senderHostname = sender.tab.url ? new URL(sender.tab.url).hostname : null;
+  if (senderHostname && isBlacklisted(senderHostname, settings)) {
+    return { ok: true, skipped: 'blacklisted' };
+  }
   for (const domItem of domItems) {
     if (!domItem.url || domItem.url.startsWith('blob:')) continue;
-    const existing = tabState.getItems(tabId).find(
+    const items = await tabState.getItems(tabId);
+    const existingIndex = items.findIndex(
       (i) => i.progressiveUrl === domItem.url || i.manifestUrl === domItem.url
     );
-    if (existing) {
-      existing.title = existing.title || domItem.title;
-      existing.posterUrl = existing.posterUrl || domItem.posterUrl;
+    if (existingIndex !== -1) {
+      const existing = items[existingIndex];
+      const merged = {
+        ...existing,
+        title: existing.title || domItem.title,
+        posterUrl: existing.posterUrl || domItem.posterUrl,
+      };
+      const updated = [...items];
+      updated[existingIndex] = merged;
+      await tabState.setItems(tabId, updated);
       continue;
     }
     const item = createMediaItem({
@@ -129,19 +163,19 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ tabId, items: domItems }) => {
       title: domItem.title,
       posterUrl: domItem.posterUrl,
     });
-    tabState.addItem(tabId, item);
+    await tabState.addItem(tabId, item);
   }
-  updateBadge(tabId);
+  await updateBadge(tabId);
   return { ok: true };
 });
 
 onMessage(MSG_TYPE.GET_TAB_ITEMS, async ({ tabId }) => {
-  return { items: tabState.getItems(tabId) };
+  return { items: await tabState.getItems(tabId) };
 });
 
 onMessage(MSG_TYPE.START_DOWNLOAD, async ({ itemId, tabId, renditionId }) => {
   const settings = await getSettings();
-  const items = tabState.getItems(tabId);
+  const items = await tabState.getItems(tabId);
   const item = items.find((i) => i.id === itemId);
   if (!item) return { ok: false, error: 'Item not found' };
 
