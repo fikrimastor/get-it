@@ -1,7 +1,7 @@
 // tests/downloader.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeFilenameSegment, renderFilename, buildDownloadPath, downloadBlob, downloadUrl } from '../src/background/downloader.js';
+import { sanitizeFilenameSegment, renderFilename, buildDownloadPath, createObjectUrl, downloadUrl } from '../src/background/downloader.js';
 
 test('sanitizeFilenameSegment strips characters illegal in filenames', () => {
   assert.equal(sanitizeFilenameSegment('a/b:c*d?e"f<g>h|i'), 'a_b_c_d_e_f_g_h_i');
@@ -35,19 +35,11 @@ test('buildDownloadPath omits the subfolder segment when blank', () => {
   assert.equal(buildDownloadPath('', 'clip.mp4'), 'clip.mp4');
 });
 
-test('downloadBlob calls the injected downloads API with a blob object URL', async () => {
-  const calls = [];
-  const fakeDownloadsApi = {
-    download: async (options) => {
-      calls.push(options);
-      return 42;
-    },
-  };
-  const id = await downloadBlob(new Blob(['x']), 'GetIt/clip.mp4', fakeDownloadsApi, false);
-  assert.equal(id, 42);
-  assert.equal(calls[0].filename, 'GetIt/clip.mp4');
-  assert.equal(calls[0].saveAs, false);
-  assert.match(calls[0].url, /^blob:/);
+test('createObjectUrl returns a blob object URL and schedules it to be revoked', async () => {
+  const url = createObjectUrl(new Blob(['x']), 50);
+  assert.match(url, /^blob:/);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await assert.rejects(() => fetch(url));
 });
 
 test('downloadUrl calls the injected downloads API with the given url', async () => {

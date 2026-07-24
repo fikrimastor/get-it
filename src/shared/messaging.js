@@ -2,6 +2,7 @@ export const MSG_TYPE = Object.freeze({
   DOM_SCAN_RESULT: 'DOM_SCAN_RESULT',
   GET_TAB_ITEMS: 'GET_TAB_ITEMS',
   START_DOWNLOAD: 'START_DOWNLOAD',
+  MERGE_TO_OBJECT_URL: 'MERGE_TO_OBJECT_URL',
 });
 
 export function sendToBackground(type, payload = {}) {

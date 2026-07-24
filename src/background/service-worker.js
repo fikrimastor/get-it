@@ -3,26 +3,20 @@ import { parseM3U8 } from './hls-parser.js';
 import { parseMPD } from './dash-parser.js';
 import { createTabStateStore, badgeTextFor } from './tab-state.js';
 import { createMediaItem, createRendition, MEDIA_TYPE, SOURCE_KIND } from '../shared/media-item.js';
-import { classifyMerge, mergeConcatFmp4, mergeRemuxTs, mergeSplitTracks, MERGE_STRATEGY } from './merge-engine.js';
-import { renderFilename, buildDownloadPath, downloadBlob, downloadUrl } from './downloader.js';
+import { classifyMerge, MERGE_STRATEGY } from './merge-engine.js';
+import { renderFilename, buildDownloadPath, downloadUrl } from './downloader.js';
 import { getSettings, isBlacklisted } from '../shared/storage.js';
 import { MSG_TYPE, onMessage } from '../shared/messaging.js';
 import { createConcurrencyLimiter } from './concurrency-limiter.js';
 import { registerContextMenu } from './context-menu.js';
+import { ensureOffscreenDocument } from './offscreen-client.js';
 
-// mux.js's UMD build reads `window` for feature detection; service workers
-// have no `window` global, so alias it to globalThis before loading.
-if (typeof window === 'undefined') {
-  globalThis.window = globalThis;
-}
-
-let muxjsInstance = null;
-async function loadMuxJs() {
-  if (muxjsInstance) return muxjsInstance;
-  await import('../../vendor/mux.js');
-  muxjsInstance = globalThis.muxjs;
-  return muxjsInstance;
-}
+// Merging HLS/DASH segments into a Blob and creating a blob: object URL
+// happens in the offscreen document (src/offscreen/offscreen.js), not here:
+// URL.createObjectURL() is unavailable in the service worker, and mux.js
+// (used for legacy MPEG-TS remuxing) can only be loaded there too, since
+// dynamic import() is disallowed in ServiceWorkerGlobalScope -- see the
+// comments in downloader.js and offscreen.js for the full rationale.
 
 // Backed by chrome.storage.session (see tab-state.js) so detected items
 // survive the service worker being torn down and restarted between
@@ -190,27 +184,23 @@ onMessage(MSG_TYPE.START_DOWNLOAD, async ({ itemId, tabId, renditionId }) => {
       const rendition = item.renditions.find((r) => r.id === renditionId) || item.renditions[0];
       const strategy = classifyMerge(rendition);
 
-      if (strategy === MERGE_STRATEGY.CONCAT_FMP4) {
-        const blob = await mergeConcatFmp4(rendition, fetch);
+      if (strategy === MERGE_STRATEGY.CONCAT_FMP4 || strategy === MERGE_STRATEGY.REMUX_TS) {
+        await ensureOffscreenDocument();
+        const merged = await chrome.runtime.sendMessage({ type: MSG_TYPE.MERGE_TO_OBJECT_URL, payload: { rendition } });
+        if (!merged || !merged.ok) return { ok: false, error: (merged && merged.error) || 'Merge failed' };
         const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
-        await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
-        return { ok: true };
-      }
-
-      if (strategy === MERGE_STRATEGY.REMUX_TS) {
-        const muxjs = await loadMuxJs();
-        const blob = await mergeRemuxTs(rendition, fetch, muxjs);
-        const filename = renderFilename(settings.filenameTemplate, { title: item.title, quality: rendition.label, ext: 'mp4' });
-        await downloadBlob(blob, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
+        await downloadUrl(merged.urls.video, buildDownloadPath(settings.subfolder, filename), chrome.downloads, settings.askWhereToSave);
         return { ok: true };
       }
 
       if (strategy === MERGE_STRATEGY.SPLIT_TRACKS) {
-        const { videoBlob, audioBlob } = await mergeSplitTracks(rendition, fetch);
+        await ensureOffscreenDocument();
+        const merged = await chrome.runtime.sendMessage({ type: MSG_TYPE.MERGE_TO_OBJECT_URL, payload: { rendition } });
+        if (!merged || !merged.ok) return { ok: false, error: (merged && merged.error) || 'Merge failed' };
         const videoFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-video`, ext: 'mp4' });
         const audioFilename = renderFilename(settings.filenameTemplate, { title: item.title, quality: `${rendition.label}-audio`, ext: 'm4a' });
-        await downloadBlob(videoBlob, buildDownloadPath(settings.subfolder, videoFilename), chrome.downloads, settings.askWhereToSave);
-        await downloadBlob(audioBlob, buildDownloadPath(settings.subfolder, audioFilename), chrome.downloads, settings.askWhereToSave);
+        await downloadUrl(merged.urls.video, buildDownloadPath(settings.subfolder, videoFilename), chrome.downloads, settings.askWhereToSave);
+        await downloadUrl(merged.urls.audio, buildDownloadPath(settings.subfolder, audioFilename), chrome.downloads, settings.askWhereToSave);
         return { ok: true, note: 'Downloaded as separate video and audio files (split adaptive tracks — see Global Constraints).' };
       }
 
