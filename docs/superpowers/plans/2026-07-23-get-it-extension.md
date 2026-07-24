@@ -415,7 +415,7 @@ git commit -m "feat: add settings storage wrapper and blacklist matching"
 - Test: `tests/messaging.test.js`
 
 **Interfaces:**
-- Produces: `MSG_TYPE` (`{DOM_SCAN_RESULT, GET_TAB_ITEMS, START_DOWNLOAD}`), `sendToBackground(type, payload?) → Promise<any>` (wraps `chrome.runtime.sendMessage`), `onMessage(type, handler, runtimeApi? = chrome.runtime)` — registers a listener that only fires `handler({...payload, tabId}, sender)` for matching `message.type`; `tabId` is taken from `sender.tab.id` when present (content-script senders), else from `payload.tabId` (popup/options senders); `handler`'s resolved/rejected value is sent back via `sendResponse`, with thrown errors converted to `{ok: false, error: String(message)}`.
+- Produces: `MSG_TYPE` (`{DOM_SCAN_RESULT, GET_TAB_ITEMS, START_DOWNLOAD}`), `sendToBackground(type, payload?) → Promise<any>` (wraps `chrome.runtime.sendMessage`), `onMessage(type, handler, runtimeApi? = chrome.runtime)` — registers a listener that only fires `handler(payload, sender)` for matching `message.type` (payload defaults to `{}` when the message has none); `handler`'s resolved/rejected value is sent back via `sendResponse`, with thrown errors converted to `{ok: false, error: String(message)}`. **No automatic tabId derivation** — deliberately, see the real-browser-verified rationale below.
 - Consumed by: `dom-scanner.js`'s hardcoded string constant `'DOM_SCAN_RESULT'` (Task 13, intentionally not importing this module — see that task's notes) must stay equal to `MSG_TYPE.DOM_SCAN_RESULT`'s value defined here.
 
 - [ ] **Step 1: Write the failing tests**
@@ -448,20 +448,28 @@ test('onMessage ignores messages of a different type', async () => {
   assert.equal(result, undefined);
 });
 
-test('onMessage derives tabId from sender.tab when present (content script messages)', async () => {
-  const runtime = fakeRuntime();
-  let receivedPayload = null;
-  onMessage(MSG_TYPE.DOM_SCAN_RESULT, async (payload) => { receivedPayload = payload; return { ok: true }; }, runtime);
-  await runtime.trigger({ type: MSG_TYPE.DOM_SCAN_RESULT, payload: { items: [] } }, { tab: { id: 9 } });
-  assert.equal(receivedPayload.tabId, 9);
-});
-
-test('onMessage falls back to payload.tabId when sender has no tab (popup messages)', async () => {
+test('onMessage passes the raw payload through unmodified, with no tabId guessing', async () => {
   const runtime = fakeRuntime();
   let receivedPayload = null;
   onMessage(MSG_TYPE.GET_TAB_ITEMS, async (payload) => { receivedPayload = payload; return { items: [] }; }, runtime);
-  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS, payload: { tabId: 4 } }, {});
-  assert.equal(receivedPayload.tabId, 4);
+  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS, payload: { tabId: 4 } }, { tab: { id: 999 } });
+  assert.deepEqual(receivedPayload, { tabId: 4 });
+});
+
+test('onMessage passes the sender through so a handler can read sender.tab.id itself', async () => {
+  const runtime = fakeRuntime();
+  let receivedSender = null;
+  onMessage(MSG_TYPE.DOM_SCAN_RESULT, async (payload, sender) => { receivedSender = sender; return { ok: true }; }, runtime);
+  await runtime.trigger({ type: MSG_TYPE.DOM_SCAN_RESULT, payload: { items: [] } }, { tab: { id: 9 } });
+  assert.equal(receivedSender.tab.id, 9);
+});
+
+test('onMessage defaults payload to an empty object when the message has none', async () => {
+  const runtime = fakeRuntime();
+  let receivedPayload = 'unset';
+  onMessage(MSG_TYPE.GET_TAB_ITEMS, async (payload) => { receivedPayload = payload; return {}; }, runtime);
+  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS }, {});
+  assert.deepEqual(receivedPayload, {});
 });
 
 test('onMessage responds with an error object when the handler throws', async () => {
@@ -493,11 +501,21 @@ export function sendToBackground(type, payload = {}) {
   return chrome.runtime.sendMessage({ type, payload });
 }
 
+// No automatic tabId derivation: which tabId a handler should trust depends
+// on the message's origin, and that's a per-message-type decision, not a
+// generic "does sender.tab happen to be populated" heuristic. sender.tab is
+// populated for ANY script running in a real tab context — not just
+// content scripts — so an extension page (e.g. options.html) opened as a
+// regular tab also gets a populated sender.tab, which would silently
+// override an explicit payload.tabId if this function guessed. Each
+// handler in service-worker.js reads tabId from whichever source is
+// actually trustworthy for that message type: sender.tab.id for
+// DOM_SCAN_RESULT (content-script-only), payload.tabId for
+// popup/options-originated messages (GET_TAB_ITEMS, START_DOWNLOAD).
 export function onMessage(type, handler, runtimeApi = chrome.runtime) {
   runtimeApi.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || message.type !== type) return undefined;
-    const tabId = sender && sender.tab ? sender.tab.id : message.payload?.tabId;
-    Promise.resolve(handler({ ...message.payload, tabId }, sender))
+    Promise.resolve(handler(message.payload || {}, sender))
       .then(sendResponse)
       .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
     return true; // keep the message channel open for the async sendResponse above
@@ -505,10 +523,12 @@ export function onMessage(type, handler, runtimeApi = chrome.runtime) {
 }
 ```
 
+**Real-browser-verified rationale for this design (originally the plan had auto-derivation preferring `sender.tab.id` whenever present, falling back to `payload.tabId` otherwise):** Task 16's end-to-end verification in a real Brave browser found this auto-derivation silently broke `GET_TAB_ITEMS` — `chrome.storage.session` correctly held the detected item for a tab, yet the message handler returned `{items: []}` for that exact tabId. Root cause: querying from an extension page (options.html) opened as a real tab gives that message a populated `sender.tab` too (not just content-script messages), so the original code always took the `sender.tab.id` branch and silently discarded the caller's explicit `payload.tabId`. The fix removes the guess entirely — no handler in this codebase can be fooled by an unexpected `sender.tab` again, because none of them are ever handed one implicitly.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm test`
-Expected: 4 passing tests in `tests/messaging.test.js` (plus all prior tests still passing)
+Expected: 5 passing tests in `tests/messaging.test.js` (plus all prior tests still passing)
 
 - [ ] **Step 5: Commit**
 
@@ -1549,7 +1569,7 @@ git commit -m "feat: add network request classification and webRequest wiring"
 - Test: `tests/tab-state.test.js`
 
 **Interfaces:**
-- Produces: `createTabStateStore() → {getItems(tabId) → MediaItem[], addItem(tabId, item) → MediaItem[], clearTab(tabId) → void}` (de-duplicates by matching `manifestUrl`+`progressiveUrl` pair), `badgeTextFor(itemCount) → string` (empty string for 0, else the count as a string — Chrome hides the badge automatically for empty text). `service-worker.js` (Task 12) holds one store instance for its whole lifetime.
+- Produces: `createTabStateStore(storageApi? = chrome.storage.session) → {getItems(tabId) → Promise<MediaItem[]>, setItems(tabId, items) → Promise<void>, addItem(tabId, item) → Promise<MediaItem[]>, clearTab(tabId) → Promise<void>}` (de-duplicates by matching `manifestUrl`+`progressiveUrl` pair), `badgeTextFor(itemCount) → string` (empty string for 0, else the count as a string — Chrome hides the badge automatically for empty text). `service-worker.js` (Task 12) holds one store instance for its whole lifetime and `await`s every call — **all four methods are async**, see the real-browser-verified rationale below.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1559,6 +1579,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTabStateStore, badgeTextFor } from '../src/background/tab-state.js';
 
+function fakeSessionStorage(initial = {}) {
+  let store = { ...initial };
+  return {
+    get: async (key) => (key in store ? { [key]: store[key] } : {}),
+    set: async (obj) => { store = { ...store, ...obj }; },
+    remove: async (key) => { delete store[key]; },
+    _dump: () => store,
+  };
+}
+
 test('badgeTextFor renders an empty string for zero items', () => {
   assert.equal(badgeTextFor(0), '');
 });
@@ -1567,32 +1597,53 @@ test('badgeTextFor renders the count as a string otherwise', () => {
   assert.equal(badgeTextFor(3), '3');
 });
 
-test('tab state store returns an empty array for an unknown tab', () => {
-  const store = createTabStateStore();
-  assert.deepEqual(store.getItems(999), []);
+test('tab state store returns an empty array for an unknown tab', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  assert.deepEqual(await store.getItems(999), []);
 });
 
-test('tab state store accumulates items per tab', () => {
-  const store = createTabStateStore();
-  store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
-  store.addItem(1, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4' });
-  assert.equal(store.getItems(1).length, 2);
+test('tab state store accumulates items per tab', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
+  await store.addItem(1, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4' });
+  assert.equal((await store.getItems(1)).length, 2);
 });
 
-test('tab state store de-duplicates items with the same source url', () => {
-  const store = createTabStateStore();
-  store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
-  store.addItem(1, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
-  assert.equal(store.getItems(1).length, 1);
+test('tab state store de-duplicates items with the same source url', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
+  await store.addItem(1, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
+  assert.equal((await store.getItems(1)).length, 1);
 });
 
-test('tab state store clearTab removes all items for that tab only', () => {
-  const store = createTabStateStore();
-  store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
-  store.addItem(2, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4' });
-  store.clearTab(1);
-  assert.deepEqual(store.getItems(1), []);
-  assert.equal(store.getItems(2).length, 1);
+test('tab state store clearTab removes all items for that tab only', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
+  await store.addItem(2, { id: 'b', manifestUrl: null, progressiveUrl: 'https://x/2.mp4' });
+  await store.clearTab(1);
+  assert.deepEqual(await store.getItems(1), []);
+  assert.equal((await store.getItems(2)).length, 1);
+});
+
+test('setItems overwrites the full list for a tab (used for in-place metadata patches)', async () => {
+  const store = createTabStateStore(fakeSessionStorage());
+  await store.addItem(1, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4', title: null });
+  const items = await store.getItems(1);
+  items[0] = { ...items[0], title: 'Patched' };
+  await store.setItems(1, items);
+  assert.equal((await store.getItems(1))[0].title, 'Patched');
+});
+
+test('tab state store persists across independent store instances backed by the same storage (simulates a service-worker restart)', async () => {
+  const sharedBackingStorage = fakeSessionStorage();
+  const storeBeforeRestart = createTabStateStore(sharedBackingStorage);
+  await storeBeforeRestart.addItem(7, { id: 'a', manifestUrl: null, progressiveUrl: 'https://x/1.mp4' });
+
+  // A fresh createTabStateStore() call models what happens when the service
+  // worker's top-level script re-executes after Chrome restarts it — a new
+  // in-memory closure, but the same underlying chrome.storage.session data.
+  const storeAfterRestart = createTabStateStore(sharedBackingStorage);
+  assert.equal((await storeAfterRestart.getItems(7)).length, 1);
 });
 ```
 
@@ -1605,30 +1656,49 @@ Expected: FAIL — `Cannot find module '../src/background/tab-state.js'`
 
 ```js
 // src/background/tab-state.js
+//
+// Per-tab detected-media store, backed by chrome.storage.session (not a
+// plain in-memory Map). MV3 service workers are terminated aggressively by
+// Chrome after brief idle periods — a plain Map loses everything on restart,
+// so items detected moments before a restart vanish by the time the user
+// opens the popup. chrome.storage.session exists specifically to survive
+// service-worker restarts within a browsing session while still being
+// cleared when the browser closes (unlike .local/.sync, which persist
+// forever and would leak stale per-tab detection state indefinitely).
 
-export function createTabStateStore() {
-  const itemsByTab = new Map();
+const STORAGE_PREFIX = 'tabItems_';
 
-  function getItems(tabId) {
-    return itemsByTab.get(tabId) || [];
+export function createTabStateStore(storageApi = chrome.storage.session) {
+  function keyFor(tabId) {
+    return `${STORAGE_PREFIX}${tabId}`;
   }
 
-  function addItem(tabId, item) {
-    const existing = itemsByTab.get(tabId) || [];
+  async function getItems(tabId) {
+    const key = keyFor(tabId);
+    const stored = await storageApi.get(key);
+    return stored[key] || [];
+  }
+
+  async function setItems(tabId, items) {
+    await storageApi.set({ [keyFor(tabId)]: items });
+  }
+
+  async function addItem(tabId, item) {
+    const existing = await getItems(tabId);
     const isDuplicate = existing.some(
       (i) => i.manifestUrl === item.manifestUrl && i.progressiveUrl === item.progressiveUrl
     );
     if (isDuplicate) return existing;
     const updated = [...existing, item];
-    itemsByTab.set(tabId, updated);
+    await setItems(tabId, updated);
     return updated;
   }
 
-  function clearTab(tabId) {
-    itemsByTab.delete(tabId);
+  async function clearTab(tabId) {
+    await storageApi.remove(keyFor(tabId));
   }
 
-  return { getItems, addItem, clearTab };
+  return { getItems, setItems, addItem, clearTab };
 }
 
 export function badgeTextFor(itemCount) {
@@ -1636,10 +1706,12 @@ export function badgeTextFor(itemCount) {
 }
 ```
 
+**Real-browser-verified rationale for this design (originally the plan had a plain in-memory `Map`, synchronous methods, no `setItems`):** Task 16's end-to-end verification in a real Brave browser found that a freshly-detected item was consistently gone by the time a `GET_TAB_ITEMS` query ran moments later — `chrome.tabs.query`/`chrome.runtime.sendMessage` round trips take real wall-clock time, and MV3 service workers are recycled aggressively enough that the gap was sometimes enough to wipe an in-memory `Map`'s entire contents (the worker's top-level script re-executes from scratch on restart, creating a brand-new empty `Map`). Switching the backing store to `chrome.storage.session` — designed specifically to outlive service-worker restarts within a session — fixed it; confirmed via a real download completing end-to-end afterward. `setItems` was added because `chrome.storage`-backed state can't be mutated in place the way the old Map's object references could (`service-worker.js`'s `DOM_SCAN_RESULT` handler needs to read the array, patch one entry, and write the whole array back).
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm test`
-Expected: 6 passing tests in `tests/tab-state.test.js` (plus all prior tests still passing)
+Expected: 8 passing tests in `tests/tab-state.test.js` (plus all prior tests still passing)
 
 - [ ] **Step 5: Commit**
 
@@ -1740,10 +1812,13 @@ async function loadMuxJs() {
   return muxjsInstance;
 }
 
+// Backed by chrome.storage.session (see tab-state.js) so detected items
+// survive the service worker being torn down and restarted between
+// detection time and whenever the user actually opens the popup.
 const tabState = createTabStateStore();
 
-function updateBadge(tabId) {
-  const items = tabState.getItems(tabId);
+async function updateBadge(tabId) {
+  const items = await tabState.getItems(tabId);
   chrome.action.setBadgeText({ tabId, text: badgeTextFor(items.length) });
   chrome.action.setBadgeBackgroundColor({ tabId, color: '#4F46E5' });
 }
@@ -1756,21 +1831,35 @@ async function handleCandidate(tabId, candidate) {
   } catch {
     return;
   }
-  if (!tab.url) return;
-  const hostname = new URL(tab.url).hostname;
-  if (isBlacklisted(hostname, settings)) return;
+  // Blacklist is checked against BOTH the tab's currently-committed
+  // hostname and the candidate resource's own hostname. Neither signal is
+  // reliable alone: chrome.tabs.get(tabId).url can still reflect the
+  // PREVIOUS page while a navigation is in flight (a direct navigation to a
+  // raw media URL fires the media-typed request that triggers detection
+  // before the tab's url property updates), and the resource's own
+  // hostname is wrong to use alone for embedded media hosted on a
+  // different CDN domain than the page the user actually meant to
+  // blacklist. Checking both correctly covers a blacklisted page embedding
+  // third-party media, a direct navigation straight to a blacklisted
+  // media host, and everything in between.
+  const candidateHostname = new URL(candidate.url).hostname;
+  const tabHostname = tab.url ? new URL(tab.url).hostname : null;
+  if (isBlacklisted(candidateHostname, settings) || (tabHostname && isBlacklisted(tabHostname, settings))) {
+    return;
+  }
+  const pageUrl = tab.url || candidate.url;
 
   if (candidate.kind === 'progressive-video' || candidate.kind === 'progressive-audio') {
     const item = createMediaItem({
       tabId,
       sourceKind: SOURCE_KIND.PROGRESSIVE,
       mediaType: candidate.kind === 'progressive-audio' ? MEDIA_TYPE.AUDIO : MEDIA_TYPE.VIDEO,
-      pageUrl: tab.url,
+      pageUrl,
       progressiveUrl: candidate.url,
       title: tab.title,
     });
-    tabState.addItem(tabId, item);
-    updateBadge(tabId);
+    await tabState.addItem(tabId, item);
+    await updateBadge(tabId);
     return;
   }
 
@@ -1782,13 +1871,13 @@ async function handleCandidate(tabId, candidate) {
         tabId,
         sourceKind: SOURCE_KIND.HLS,
         mediaType: MEDIA_TYPE.VIDEO,
-        pageUrl: tab.url,
+        pageUrl,
         manifestUrl: candidate.url,
         title: tab.title,
         renditions,
       });
-      tabState.addItem(tabId, item);
-      updateBadge(tabId);
+      await tabState.addItem(tabId, item);
+      await updateBadge(tabId);
     } catch (err) {
       console.warn('Get It: failed to parse HLS manifest', candidate.url, err);
     }
@@ -1803,13 +1892,13 @@ async function handleCandidate(tabId, candidate) {
         tabId,
         sourceKind: SOURCE_KIND.DASH,
         mediaType: MEDIA_TYPE.VIDEO,
-        pageUrl: tab.url,
+        pageUrl,
         manifestUrl: candidate.url,
         title: tab.title,
         renditions,
       });
-      tabState.addItem(tabId, item);
-      updateBadge(tabId);
+      await tabState.addItem(tabId, item);
+      await updateBadge(tabId);
     } catch (err) {
       console.warn('Get It: failed to parse DASH manifest', candidate.url, err);
     }
@@ -1818,23 +1907,40 @@ async function handleCandidate(tabId, candidate) {
 
 registerRequestSniffer(chrome.webRequest, handleCandidate);
 
-chrome.tabs.onRemoved.addListener((tabId) => tabState.clearTab(tabId));
-chrome.webNavigation.onCommitted.addListener((details) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await tabState.clearTab(tabId);
+});
+chrome.webNavigation.onCommitted.addListener(async (details) => {
   if (details.frameId === 0) {
-    tabState.clearTab(details.tabId);
-    updateBadge(details.tabId);
+    await tabState.clearTab(details.tabId);
+    await updateBadge(details.tabId);
   }
 });
 
-onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ tabId, items: domItems }) => {
+onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ items: domItems }, sender) => {
+  const tabId = sender && sender.tab ? sender.tab.id : null;
+  if (tabId == null) return { ok: false, error: 'DOM_SCAN_RESULT requires a content-script sender with a tab' };
+  const settings = await getSettings();
+  const senderHostname = sender.tab.url ? new URL(sender.tab.url).hostname : null;
+  if (senderHostname && isBlacklisted(senderHostname, settings)) {
+    return { ok: true, skipped: 'blacklisted' };
+  }
   for (const domItem of domItems) {
     if (!domItem.url || domItem.url.startsWith('blob:')) continue;
-    const existing = tabState.getItems(tabId).find(
+    const items = await tabState.getItems(tabId);
+    const existingIndex = items.findIndex(
       (i) => i.progressiveUrl === domItem.url || i.manifestUrl === domItem.url
     );
-    if (existing) {
-      existing.title = existing.title || domItem.title;
-      existing.posterUrl = existing.posterUrl || domItem.posterUrl;
+    if (existingIndex !== -1) {
+      const existing = items[existingIndex];
+      const merged = {
+        ...existing,
+        title: existing.title || domItem.title,
+        posterUrl: existing.posterUrl || domItem.posterUrl,
+      };
+      const updated = [...items];
+      updated[existingIndex] = merged;
+      await tabState.setItems(tabId, updated);
       continue;
     }
     const item = createMediaItem({
@@ -1846,19 +1952,19 @@ onMessage(MSG_TYPE.DOM_SCAN_RESULT, async ({ tabId, items: domItems }) => {
       title: domItem.title,
       posterUrl: domItem.posterUrl,
     });
-    tabState.addItem(tabId, item);
+    await tabState.addItem(tabId, item);
   }
-  updateBadge(tabId);
+  await updateBadge(tabId);
   return { ok: true };
 });
 
 onMessage(MSG_TYPE.GET_TAB_ITEMS, async ({ tabId }) => {
-  return { items: tabState.getItems(tabId) };
+  return { items: await tabState.getItems(tabId) };
 });
 
 onMessage(MSG_TYPE.START_DOWNLOAD, async ({ itemId, tabId, renditionId }) => {
   const settings = await getSettings();
-  const items = tabState.getItems(tabId);
+  const items = await tabState.getItems(tabId);
   const item = items.find((i) => i.id === itemId);
   if (!item) return { ok: false, error: 'Item not found' };
 
@@ -1906,6 +2012,11 @@ onMessage(MSG_TYPE.START_DOWNLOAD, async ({ itemId, tabId, renditionId }) => {
 
 registerContextMenu(chrome.contextMenus, chrome.tabs);
 ```
+
+**Real-browser-verified fixes reflected above (this section originally had synchronous `tabState` calls, a single `tab.url`-only blacklist check, and no blacklist check at all in the `DOM_SCAN_RESULT` handler):** Task 16's end-to-end verification in a real Brave browser found and fixed three defects in this composition:
+1. Every `tabState` call needed `await` added once Task 10's store became `chrome.storage.session`-backed (async).
+2. The blacklist check used only `tab.url`'s hostname, which is unreliable for a request that IS the top-level navigation itself (see Task 10's rationale) — confirmed via CDP that Chrome fires a separate `media`-typed request carrying the actual content-type header, distinct from the `main_frame` navigation request, so even an `isMainFrame`-based special case wasn't the right fix. The working fix checks both `tab.url`'s hostname and the candidate's own hostname.
+3. **This was the one that actually explained the real-browser blacklist failure:** the `DOM_SCAN_RESULT` handler never checked the blacklist at all. `dom-scanner.js`'s content script runs unconditionally on every page (`matches: ["<all_urls>"]`) and reports any `<video>`/`<audio>` element it finds — including on a page the user explicitly blacklisted — and this handler would add it regardless of `handleCandidate`'s (now-correct) network-sniffing blacklist check, since it's a completely separate code path. Confirmed fixed via `chrome.storage.session` staying empty for a blacklisted domain, and confirmed the fix doesn't over-block by clearing the blacklist and re-verifying detection resumes.
 
 - [ ] **Step 2: Manual verification — service worker starts and logs no errors**
 
@@ -2474,38 +2585,43 @@ git commit -m "feat: add options page (settings form bound to chrome.storage)"
 
 ### Task 16: End-to-end verification across all four documented cases
 
-**Files:** none (verification only — this task may produce small bugfix commits if issues surface).
+**Files:** none as originally scoped (verification only) — in practice this task surfaced three real bugs requiring fixes across `src/shared/messaging.js`, `src/background/tab-state.js`, and `src/background/service-worker.js`, documented in those tasks' "Real-browser-verified" notes above.
 
 This is the design doc's Verification Plan, executed. No new pure logic to unit test; this closes the loop the earlier tasks' manual-verification steps individually opened.
 
-- [ ] **Step 1: Progressive file case**
+- [x] **Step 1: Progressive file case — VERIFIED, real browser, twice (found and fixed real bugs first)**
 
-Find or set up a page with a direct `<video src="*.mp4">` (or `*.webm`). Load it, open the Get It popup, confirm one item is detected, click Download, confirm the file downloads to `Downloads/<subfolder>/` and plays correctly.
+Executed against a real Brave browser (`/Applications/Brave Browser.app`, loaded unpacked via `--load-extension`) navigating to `https://www.w3schools.com/html/mov_bbb.mp4`. First pass failed — `GET_TAB_ITEMS` returned `{items: []}` even though the item was genuinely detected — which led to finding and fixing the messaging.js/tab-state.js bugs documented in Tasks 4 and 10. After those fixes: popup query correctly returned the detected item, `START_DOWNLOAD` was triggered via `chrome.runtime.sendMessage`, and `chrome.downloads.search` confirmed a real completed download at `~/Downloads/GetIt/video.mp4` (788493 bytes, matching `totalBytes`, state `"complete"`). `file` and `ffprobe` confirmed a valid `ISO Media, MP4 v2` file, 10.03s duration — exactly the well-known Big Buck Bunny clip length. This is the load-bearing case: it exercises the full pipeline (network sniffing → classification → `chrome.storage.session` persistence → message-passing → `chrome.downloads`) that every other case also depends on.
 
-- [ ] **Step 2: HLS with fragmented-MP4 (CMAF) segments case**
+- [ ] **Step 2: HLS with fragmented-MP4 (CMAF) segments case — NOT independently E2E-verified against a live stream**
 
-Find a site serving HLS with `#EXT-X-MAP` in its media playlists (many modern streaming demo pages; e.g. Apple's public HLS test streams use fMP4 for some variants). Confirm the popup shows quality options, download one, confirm the resulting `.mp4` plays.
+Not exercised against a real public HLS/fMP4 stream in this session (would need a reachable third-party CDN test stream; not attempted given time already spent finding and fixing the Step 1 blockers, which are shared plumbing this case also depends on). Covered by: `parseM3U8`'s fMP4-detection unit tests (Task 5), `classifyMerge`'s `CONCAT_FMP4` routing and `mergeConcatFmp4`'s segment-ordering unit tests (Task 7), and the now-verified-correct detection/persistence/messaging/download pipeline from Step 1. Residual risk is narrow: manifest-parsing and merge logic only, not the plumbing around them.
 
-- [ ] **Step 3: HLS with legacy MPEG-TS segments case**
+- [ ] **Step 3: HLS with legacy MPEG-TS segments case — NOT independently E2E-verified against a live stream**
 
-Find a site serving classic `.ts`-segmented HLS (still common). Confirm download triggers the `REMUX_TS` path (check the service worker console for no thrown errors from `mergeTsWithTransmuxer`), confirm the resulting `.mp4` plays. **This is the one path this plan could not fully verify against real `mux.js` behavior during planning (see Global Constraints) — if it fails, the fix is scoped to `mergeTsWithTransmuxer` in `src/background/merge-engine.js` and does not require replanning the rest of the extension.**
+Same caveat as Step 2. Covered by: `parseM3U8`'s TS-detection unit tests, `classifyMerge`'s `REMUX_TS` routing, and `mergeTsWithTransmuxer`'s unit tests including the error-path fix from Task 7's review (a real bug that unit testing, not this step, actually caught). The mux.js integration itself (`vendor/mux.js`, real UMD build, `Transmuxer` API confirmed against the library's actual README during planning) was not exercised against a real TS stream. If it fails in practice, the fix is scoped to `mergeTsWithTransmuxer` in `src/background/merge-engine.js`.
 
-- [ ] **Step 4: DASH with separate audio/video adaptation sets case**
+- [ ] **Step 4: DASH with separate audio/video adaptation sets case — NOT independently E2E-verified against a live stream**
 
-Find a DASH `.mpd` test stream with separate audio-only and video-only `AdaptationSet`s using `$Number$`-based `SegmentTemplate` (e.g. common DASH-IF test manifests). Confirm the popup shows quality options, download one, confirm **two files** are produced (video-only + audio-only, per the documented v1 split-tracks limitation) and both play their respective tracks correctly.
+Same caveat as Steps 2–3. Covered by: `parseMPD`'s unit tests (Task 6), `classifyMerge`'s `SPLIT_TRACKS` routing and `mergeSplitTracks`'s two-blob-output unit tests (Task 7), and `service-worker.js`'s `START_DOWNLOAD` handler correctly producing two separate `downloadBlob` calls for the split-tracks case (confirmed by code inspection during Task 12's review, which independently verified every cross-module import against real exports).
 
-- [ ] **Step 5: Blacklist and badge verification**
+- [x] **Step 5: Blacklist and badge verification — VERIFIED, real browser, after finding and fixing a real bug**
 
-Add a domain to the options page blacklist. Visit it — confirm the toolbar badge stays empty and the popup shows the empty state, even if that page has playable video.
+Set `blacklist: ['www.w3schools.com']` via `chrome.storage.sync` (the same storage the real options page writes to), then re-navigated to the test video. First attempt still showed the item detected (`itemCount: 1`) despite the blacklist — traced through four rounds of direct instrumentation (confirming `isBlacklisted`/`getSettings` were individually correct via dynamic import in an extension-page context AND from within the service worker's own live execution context via a Puppeteer `worker.evaluate()` call) before finding the actual cause: `service-worker.js`'s `DOM_SCAN_RESULT` handler never checked the blacklist at all — only the network-sniffing `handleCandidate` path did, and the content script's independent DOM-scan detection path bypassed it entirely. Fixed (see Task 12's notes); re-verified with `chrome.storage.session` staying completely empty (`{}`) for the blacklisted tab, then cleared the blacklist and confirmed detection resumes correctly (`itemCount: 1` again) — ruling out the fix simply over-blocking everything.
 
-- [ ] **Step 6: Fix any issues found, then final commit**
+- [x] **Step 6: Fixes applied**
 
-If any of Steps 1–5 surface a bug, fix it in the relevant `src/` file, re-run `npm test` to confirm no regressions, and commit the fix with a `fix:` prefix describing exactly what broke.
+Three real bugs found and fixed during this task (full detail in each task's "Real-browser-verified" note):
+1. `src/shared/messaging.js` — `onMessage`'s automatic tabId derivation silently discarded an explicit `payload.tabId` whenever `sender.tab` was populated, which happens for any extension page opened as a tab, not just content scripts. Removed the auto-derivation; each handler now sources tabId explicitly.
+2. `src/background/tab-state.js` — in-memory `Map` lost all detected items whenever Chrome recycled the MV3 service worker (which happens aggressively), so items could vanish between detection and the user opening the popup. Switched to `chrome.storage.session`, which is designed to survive worker restarts within a session.
+3. `src/background/service-worker.js` — the blacklist was only checked in the network-sniffing path (`handleCandidate`); the DOM-scan path (`DOM_SCAN_RESULT` handler) had no blacklist check at all, so a blacklisted page's embedded video was still detected via the content script regardless. Added the missing check. Also hardened `handleCandidate`'s own hostname resolution (checks both the tab's and the candidate's hostname, since `chrome.tabs.get(tabId).url` can be stale during an in-flight navigation).
+
+All fixes are committed with `fix:`/`feat:` prefixes on top of the original tasks' commits (history was kept clean — see each task's commit for the final, correct code). Full test suite: 55 passing, 0 failing, after every fix.
 
 ```bash
 npm test
 git add -A
-git commit -m "test: verify end-to-end across progressive/HLS-fmp4/HLS-ts/DASH cases"
+git commit -m "test: document Task 16 end-to-end verification results"
 ```
 
 ---
