@@ -1,4 +1,3 @@
-// tests/messaging.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MSG_TYPE, onMessage } from '../src/shared/messaging.js';
@@ -25,20 +24,28 @@ test('onMessage ignores messages of a different type', async () => {
   assert.equal(result, undefined);
 });
 
-test('onMessage derives tabId from sender.tab when present (content script messages)', async () => {
-  const runtime = fakeRuntime();
-  let receivedPayload = null;
-  onMessage(MSG_TYPE.DOM_SCAN_RESULT, async (payload) => { receivedPayload = payload; return { ok: true }; }, runtime);
-  await runtime.trigger({ type: MSG_TYPE.DOM_SCAN_RESULT, payload: { items: [] } }, { tab: { id: 9 } });
-  assert.equal(receivedPayload.tabId, 9);
-});
-
-test('onMessage falls back to payload.tabId when sender has no tab (popup messages)', async () => {
+test('onMessage passes the raw payload through unmodified, with no tabId guessing', async () => {
   const runtime = fakeRuntime();
   let receivedPayload = null;
   onMessage(MSG_TYPE.GET_TAB_ITEMS, async (payload) => { receivedPayload = payload; return { items: [] }; }, runtime);
-  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS, payload: { tabId: 4 } }, {});
-  assert.equal(receivedPayload.tabId, 4);
+  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS, payload: { tabId: 4 } }, { tab: { id: 999 } });
+  assert.deepEqual(receivedPayload, { tabId: 4 });
+});
+
+test('onMessage passes the sender through so a handler can read sender.tab.id itself', async () => {
+  const runtime = fakeRuntime();
+  let receivedSender = null;
+  onMessage(MSG_TYPE.DOM_SCAN_RESULT, async (payload, sender) => { receivedSender = sender; return { ok: true }; }, runtime);
+  await runtime.trigger({ type: MSG_TYPE.DOM_SCAN_RESULT, payload: { items: [] } }, { tab: { id: 9 } });
+  assert.equal(receivedSender.tab.id, 9);
+});
+
+test('onMessage defaults payload to an empty object when the message has none', async () => {
+  const runtime = fakeRuntime();
+  let receivedPayload = 'unset';
+  onMessage(MSG_TYPE.GET_TAB_ITEMS, async (payload) => { receivedPayload = payload; return {}; }, runtime);
+  await runtime.trigger({ type: MSG_TYPE.GET_TAB_ITEMS }, {});
+  assert.deepEqual(receivedPayload, {});
 });
 
 test('onMessage responds with an error object when the handler throws', async () => {
